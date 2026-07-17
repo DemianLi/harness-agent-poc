@@ -209,3 +209,4 @@ __marimo__/
 # Runtime memory files — tracked locally only
 memory/AGENTS.md
 memory/repos/*.md
+memory/audit.log

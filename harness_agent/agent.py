@@ -12,8 +12,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from .llm.providers import invoke_with_retry
 from .middleware.compact import CompactMiddleware
-from .middleware.hitl import request_approval
+from .middleware.hitl import log_decision, request_approval
 from .middleware.memory import MemoryMiddleware, ensure_memory_files
 from .tools.filesystem import FILESYSTEM_TOOLS, HIGH_RISK_TOOLS
 
@@ -21,15 +22,32 @@ from .tools.filesystem import FILESYSTEM_TOOLS, HIGH_RISK_TOOLS
 # --------------------------------------------------------------------------- #
 # State                                                                        #
 # --------------------------------------------------------------------------- #
+#
+# Orchestration contract (control loop): a single linear ReAct-style loop —
+#
+#   entry -> "agent" --tool_calls present--> "tools" -> "agent" (repeat)
+#                    \--no tool_calls------> END
+#
+# implemented via LangGraph's `tools_condition`. There is no planner node and
+# no sub-agent fan-out; every turn is one LLM call followed by at most one
+# batch of tool calls. State is checkpointed by `MemorySaver`, which is
+# **in-process memory only** — it does not survive a process restart and is
+# not shared across concurrent processes. Do not rely on it as durable
+# storage; it exists solely to let `_repl` resume the same thread across
+# turns within one CLI invocation.
 
 class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
-    # Initialised once at startup
+    # Initialised once at startup. Invariant: once True, memory_loaded is
+    # never reset for the lifetime of a thread_id.
     memory_loaded: bool
     global_memory: str
     repo_memory: str
     # True once the user has approved any write_file call this session;
     # subsequent write_file calls skip the HITL prompt automatically.
+    # Invariant: monotonic per thread_id — set True -> False transitions
+    # never happen. A rejected approval leaves this False and re-prompts
+    # on the next high-risk tool call.
     writes_approved: bool
 
 
@@ -73,16 +91,26 @@ def build_graph(llm: Any, repo_name: str) -> Any:
         system = memory_mw.inject_system(system_prompt, state)
 
         try:
-            response = model_with_tools.invoke(
-                [SystemMessage(content=system)] + messages
+            response = invoke_with_retry(
+                model_with_tools, [SystemMessage(content=system)] + messages
             )
         except BadRequestError as e:
-            # Azure content filter or other 400 errors — surface gracefully
-            # instead of crashing the whole process
+            # Azure/OpenAI content filter or other 400 errors — not retryable,
+            # surface gracefully instead of crashing the whole process.
             error_detail = _extract_content_filter_reason(e)
             response = AIMessage(
                 content=f"⚠️ Request blocked by the LLM provider: {error_detail}\n"
                         f"Try rephrasing your last message or starting a new session."
+            )
+        except Exception as e:
+            # Any other provider error left over after invoke_with_retry's
+            # retry budget is exhausted (or a non-transient error it didn't
+            # retry). Contract: the session MUST stay alive — degrade to a
+            # visible error message rather than propagating and killing the
+            # REPL loop.
+            response = AIMessage(
+                content=f"⚠️ LLM call failed after retries: {e}\n"
+                        f"Try again, or switch providers with --model."
             )
 
         updates["messages"] = [response]
@@ -114,6 +142,7 @@ def build_graph(llm: Any, repo_name: str) -> Any:
         # Handle risky tools — ask once, then remember the decision
         if risky:
             approved = request_approval(risky)
+            log_decision(repo_name=repo_name, tool_calls=risky, approved=approved)
 
             if approved:
                 state_updates["writes_approved"] = True  # skip future prompts

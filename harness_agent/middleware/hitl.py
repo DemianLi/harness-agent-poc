@@ -1,16 +1,39 @@
-"""Human-in-the-loop middleware: pauses before high-risk tool calls for approval."""
+"""Human-in-the-loop middleware: pauses before high-risk tool calls for approval.
+
+Permission contract
+--------------------
+- Risk classification is defined once, in `tools/filesystem.py::HIGH_RISK_TOOLS`
+  (see that module's docstring for the classification rationale). This module
+  does not re-derive risk; it only renders the approval prompt and records
+  the decision.
+- Approval scope: `request_approval()` is called with ALL risky tool calls
+  from a single agent turn as one batch; the human's decision (yes/no)
+  applies to the entire batch atomically — there is no partial approval.
+- Approval durability: the decision itself does not persist here. The caller
+  (`agent.py`) is responsible for the session-level `writes_approved` flag;
+  this module only renders the prompt and appends an immutable audit record.
+- Audit trail: every decision (approved or rejected) MUST be appended to the
+  audit log via `log_decision()` before the tool calls are executed. The log
+  is append-only, one JSON object per line (JSONL), and is never mutated or
+  truncated by this module.
+"""
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-from ..tools.filesystem import HIGH_RISK_TOOLS
-
 console = Console()
+
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+AUDIT_LOG_DIR = _PROJECT_ROOT / "memory"
+AUDIT_LOG_FILE = AUDIT_LOG_DIR / "audit.log"
 
 
 def request_approval(tool_calls: list[dict[str, Any]]) -> bool:
@@ -52,3 +75,27 @@ def request_approval(tool_calls: list[dict[str, Any]]) -> bool:
         if choice in ("n", "no"):
             return False
         console.print("[dim]Please enter y or n.[/dim]")
+
+
+def log_decision(repo_name: str, tool_calls: list[dict[str, Any]], approved: bool) -> None:
+    """Append an immutable audit record for a batch approval decision.
+
+    Contract: one JSON line per decision, never overwritten or removed.
+    Failure to write the audit log is non-fatal (a missing/unwritable
+    memory dir must not block the agent turn) — it is logged to stderr
+    via console instead.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "repo": repo_name,
+        "approved": approved,
+        "tool_calls": [
+            {"name": tc.get("name"), "args": tc.get("args", {})} for tc in tool_calls
+        ],
+    }
+    try:
+        AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        console.print(f"[dim red]Warning: could not write audit log: {e}[/dim red]")

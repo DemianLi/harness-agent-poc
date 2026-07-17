@@ -210,3 +210,4 @@ __marimo__/
 memory/AGENTS.md
 memory/repos/*.md
 memory/audit.log
+memory/feedback.log

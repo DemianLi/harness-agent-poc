@@ -2,12 +2,15 @@
 
 This document is the normative specification for the six layers that make up
 this harness: **Model**, **Tools**, **Memory**, **Context (Compact)**,
-**Permission (HITL)**, and **Orchestration (control loop)**. Each section
-defines the interface/data contract, configuration parameters and their
-rationale, the error taxonomy, invariants, and failure modes for that layer.
-Where a layer has an explicit trust boundary (a limitation it deliberately
-does not solve), that boundary is stated so it is a documented decision, not
-a silent gap.
+**Permission (HITL)**, and **Orchestration (control loop)** — plus two
+additions layered on top: the **Interaction** tool (§2b, `ask_user`) and the
+**Feedback** layer (§7), which is explicitly called out as an extension
+beyond the base six rather than a seventh structural requirement of the
+pattern. Each section defines the interface/data contract, configuration
+parameters and their rationale, the error taxonomy, invariants, and failure
+modes for that layer. Where a layer has an explicit trust boundary (a
+limitation it deliberately does not solve), that boundary is stated so it is
+a documented decision, not a silent gap.
 
 Status: this spec describes the implementation as of this revision. If code
 and spec disagree, that is a bug in one of the two — file it as such.
@@ -131,6 +134,45 @@ explicitly out of scope for this layer as specified.
 
 ---
 
+## 2b. Interaction Tool (`ask_user`)
+
+**Module:** `harness_agent/tools/interaction.py`
+
+### Interface contract
+
+```
+ask_user(question: str, options: list[str] = []) -> str
+```
+
+Blocks synchronously on console input and returns the human's answer as a
+plain string (if `options` is given and the human types a number in range,
+the corresponding option string is returned instead of the raw digit).
+
+### Risk classification
+
+Read-only, side-effect-free → never a member of `HIGH_RISK_TOOLS`, never
+requires HITL approval (§5). It is bound to the model alongside the
+filesystem tools (`agent.py::ALL_TOOLS = FILESYSTEM_TOOLS + INTERACTION_TOOLS`).
+
+### Explicit trust boundary — this does not force clarification
+
+Nothing in the graph *requires* the model to call `ask_user` before acting
+on an ambiguous request; `prompts/system.md` instructs it to, but that is a
+convention the model can still choose not to follow. What this tool changes
+is **observability**: every clarification attempt now appears in the same
+tool-call trace as `read_file`/`write_file` calls, instead of living only as
+free-form text the model may or may not have actually asked. A hard
+guarantee ("must always ask before X") would require the control loop
+itself to detect ambiguity and force a branch to this tool — that is not
+implemented; see §6 for the orchestration layer's actual (single-path,
+no-planner) shape.
+
+`_stream_response` in `main.py` excludes `ask_user` calls when counting
+"did this turn do something" for the §7 feedback prompt — asking a
+question is not, by itself, a completed task.
+
+---
+
 ## 3. Memory Layer
 
 **Module:** `harness_agent/middleware/memory.py`
@@ -229,12 +271,24 @@ that cannot summarize should still be able to keep talking.
   are shown together in one `request_approval()` call; the human's yes/no
   decision applies to the entire batch — there is no partial approval of
   a subset.
-- **Session-scoped durability:** approval state lives in `AgentState`, not
-  in this module. `agent.py`'s `writes_approved` flag is **monotonic** per
-  `thread_id` — once set `True`, it is never reset back to `False` within
-  that thread. A rejection leaves it `False` and the next high-risk call
-  re-prompts. There is no "approve once for this specific file" scope —
-  approval is session-wide once granted.
+- **Configurable durability — `approval_scope`:** resolved by
+  `resolve_approval_scope(override) -> "session" | "call"` (explicit
+  override — e.g. the `--approval-scope` CLI flag — > `HARNESS_APPROVAL_SCOPE`
+  env var > `"session"` default). An unrecognised env value silently falls
+  back to `"session"` (a runtime setting, not a startup precondition); an
+  unrecognised `--approval-scope` CLI value is rejected up front by
+  `click.Choice` (fail fast on operator typos).
+  - `"session"` (default, backward-compatible): approval state lives in
+    `AgentState.writes_approved`, which is **monotonic** per `thread_id` —
+    once set `True`, it is never reset back to `False` within that thread.
+    A rejection leaves it `False` and the next high-risk call re-prompts.
+    There is no "approve once for this specific file" scope — approval is
+    session-wide once granted.
+  - `"call"`: `tool_node_with_hitl` treats `writes_approved` as always
+    `False` regardless of what is stored in state — every batch of
+    high-risk calls is re-prompted, with no session-wide memory of prior
+    approvals. Use this when "must confirm every high-risk operation" is a
+    hard requirement rather than a one-time session grant.
 
 ### Audit contract — `log_decision(repo_name, tool_calls, approved)`
 
@@ -282,7 +336,7 @@ ReAct-style loop, not a multi-agent orchestrator.
 | `messages` | Accumulates via `add_messages` reducer; never rewritten wholesale except by Context-layer compaction (§4), which replaces the list under its own documented invariant |
 | `memory_loaded` | Set `True` at most once per `thread_id`; never reset |
 | `global_memory`, `repo_memory` | Set once, alongside `memory_loaded`; read-only afterward within the thread |
-| `writes_approved` | Monotonic per `thread_id` (see §5) |
+| `writes_approved` | Monotonically set within the field itself once `True` (see §5); whether that stored value is *honoured* on the next high-risk call additionally depends on `approval_scope` — `"session"` honours it, `"call"` ignores it |
 
 ### Persistence contract
 
@@ -301,16 +355,61 @@ operation, so the control loop itself has no undocumented crash path.
 
 ---
 
+## 7. Feedback Layer (extension beyond the base six)
+
+**Module:** `harness_agent/middleware/feedback.py`,
+`harness_agent/main.py::_repl`/`_stream_response` (trigger point)
+
+This layer is explicitly **not** one of the original six (Model, Tools,
+Memory, Context, Permission, Orchestration) — it is called out separately
+so it isn't mistaken for a structural requirement of the harness pattern
+itself. It exists to close the gap identified in the prior review: no
+mechanism previously collected user-perceived quality signal after a turn.
+
+### Trigger contract — `maybe_prompt_feedback(repo_name, tool_names_this_turn)`
+
+- Fires only when `tool_names_this_turn` is non-empty — i.e., the turn
+  executed at least one real tool call. A purely conversational reply (the
+  model answered from context with zero tool calls) does not trigger it.
+  `ask_user` calls are excluded from this list by `_stream_response` (§2b) —
+  asking a clarifying question is not, on its own, a completed task.
+- Always skippable: pressing Enter with no input returns immediately and
+  writes nothing. Any input not recognised as good/bad (`g`/`good`/`b`/`bad`,
+  case-insensitive) is treated as a skip, never an error — a malformed
+  answer must never block the next turn from proceeding.
+- On a `"bad"` rating, one optional free-text follow-up ("What went
+  wrong") is collected; `"good"` collects no further input.
+
+### Storage contract
+
+Append-only JSONL at `memory/feedback.log`:
+`{"timestamp": <ISO8601 UTC>, "repo": ..., "tool_calls_this_turn": [...], "rating": "good"|"bad", "comment": str}`.
+One record per non-skipped rating; skipped prompts write nothing. Write
+failure is non-fatal (same contract as §5's audit log) — a warning is
+printed and the turn proceeds.
+
+### Explicit trust boundary
+
+This is local, unaggregated, single-user telemetry — there is no rollup,
+no dashboard, no correlation with a specific model/provider/session for
+analysis. A product surface needs a real analytics pipeline consuming this
+log (or replacing it with a hosted telemetry backend); this layer only
+guarantees the signal is captured at the point of interaction.
+
+---
+
 ## Cross-layer summary
 
 | Layer | Formal contract now covers | Still explicitly out of scope (by design) |
 |---|---|---|
 | Model | Provider resolution, error taxonomy, retry policy, degrade-not-crash | Cost metering, cross-provider error message normalization |
 | Tools | Input schemas, error-code taxonomy, bounded output, risk classification | Path sandboxing / multi-tenant isolation |
+| Interaction (`ask_user`) | Blocking clarification tool, observable in the tool-call trace | Cannot be forced by the control loop — model-discretionary |
 | Memory | File schema, preference-extraction rule, failure mode | Multi-user namespace, semantic recall |
 | Context | Configurable thresholds w/ rationale, compaction invariant, failure mode | Adaptive/semantic compaction |
-| Permission | Batch-approval semantics, session-scope invariant, audit log | Async review queue, RBAC, per-path policy |
+| Permission | Batch-approval semantics, configurable `approval_scope`, audit log | Async review queue, RBAC, per-path policy |
 | Orchestration | State machine, state invariants, persistence contract | Planning layer, multi-agent fan-out, durable checkpoint backend |
+| Feedback (extension) | Skippable post-turn rating, append-only log | Aggregation/dashboard, per-model/session analytics |
 
 Anything in the right-hand column is a deliberate scope boundary, not an
 oversight — see the previous architecture review for what's required to

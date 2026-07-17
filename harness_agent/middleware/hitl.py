@@ -10,17 +10,37 @@ Permission contract
   from a single agent turn as one batch; the human's decision (yes/no)
   applies to the entire batch atomically — there is no partial approval.
 - Approval durability: the decision itself does not persist here. The caller
-  (`agent.py`) is responsible for the session-level `writes_approved` flag;
-  this module only renders the prompt and appends an immutable audit record.
+  (`agent.py`) is responsible for applying the `approval_scope` setting
+  below to the session-level `writes_approved` flag; this module only
+  renders the prompt and appends an immutable audit record.
 - Audit trail: every decision (approved or rejected) MUST be appended to the
   audit log via `log_decision()` before the tool calls are executed. The log
   is append-only, one JSON object per line (JSONL), and is never mutated or
   truncated by this module.
+
+Approval scope configuration
+------------------------------
+`HARNESS_APPROVAL_SCOPE` (env var) or the `--approval-scope` CLI flag
+selects how long an approval lasts, resolved by `resolve_approval_scope()`:
+
+- `"session"` (default) — approving one batch of high-risk calls sets
+  `writes_approved = True` for the rest of the thread; subsequent high-risk
+  calls in the same session are NOT re-prompted. This is the original
+  behaviour, kept as the default for backward compatibility.
+- `"call"` — every batch of high-risk calls is prompted, regardless of
+  prior approvals in the same thread. Use this when "must ask every time"
+  is a hard requirement rather than a one-time session grant.
+
+An unrecognised value (bad env var) falls back to `"session"` rather than
+raising, since this is a runtime environment setting, not a startup
+precondition; an unrecognised `--approval-scope` CLI value is rejected
+up front by `click.Choice` instead (fail fast on operator typos).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +54,14 @@ console = Console()
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 AUDIT_LOG_DIR = _PROJECT_ROOT / "memory"
 AUDIT_LOG_FILE = AUDIT_LOG_DIR / "audit.log"
+
+VALID_APPROVAL_SCOPES = ("session", "call")
+
+
+def resolve_approval_scope(override: str | None = None) -> str:
+    """Resolve the approval scope: explicit override > env var > "session" default."""
+    candidate = (override or os.getenv("HARNESS_APPROVAL_SCOPE") or "session").strip().lower()
+    return candidate if candidate in VALID_APPROVAL_SCOPES else "session"
 
 
 def request_approval(tool_calls: list[dict[str, Any]]) -> bool:

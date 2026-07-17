@@ -14,9 +14,15 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from .llm.providers import invoke_with_retry
 from .middleware.compact import CompactMiddleware
-from .middleware.hitl import log_decision, request_approval
+from .middleware.hitl import log_decision, request_approval, resolve_approval_scope
 from .middleware.memory import MemoryMiddleware, ensure_memory_files
 from .tools.filesystem import FILESYSTEM_TOOLS, HIGH_RISK_TOOLS
+from .tools.interaction import INTERACTION_TOOLS
+
+# All tools bound to the model: filesystem tools + the ask_user clarification
+# tool. Risk classification (HIGH_RISK_TOOLS) is unaffected — ask_user is
+# read-only and is never in that set (see tools/interaction.py).
+ALL_TOOLS = FILESYSTEM_TOOLS + INTERACTION_TOOLS
 
 
 # --------------------------------------------------------------------------- #
@@ -55,21 +61,25 @@ class AgentState(TypedDict):
 # Graph builder                                                                #
 # --------------------------------------------------------------------------- #
 
-def build_graph(llm: Any, repo_name: str) -> Any:
+def build_graph(llm: Any, repo_name: str, approval_scope: str | None = None) -> Any:
     """Build and compile the LangGraph agent graph.
 
     Args:
         llm: A LangChain chat model.
         repo_name: Name of the repo being analysed (used for memory + reports path).
+        approval_scope: "session" (default) or "call" — see
+            `middleware/hitl.py::resolve_approval_scope` for the contract.
+            None resolves from the `HARNESS_APPROVAL_SCOPE` env var.
 
     Returns:
         A compiled LangGraph app.
     """
     system_prompt = _load_system_prompt(repo_name)
+    approval_scope = resolve_approval_scope(approval_scope)
 
     memory_mw = MemoryMiddleware(repo_name=repo_name)
     compact_mw = CompactMiddleware(llm=llm)
-    model_with_tools = llm.bind_tools(FILESYSTEM_TOOLS)
+    model_with_tools = llm.bind_tools(ALL_TOOLS)
 
     ensure_memory_files(repo_name)
 
@@ -117,12 +127,16 @@ def build_graph(llm: Any, repo_name: str) -> Any:
         return updates
 
     def tool_node_with_hitl(state: AgentState) -> dict:
-        """Execute tools; ask for approval on write_file only once per session."""
+        """Execute tools; gate write_file behind approval per `approval_scope`."""
         last = state["messages"][-1]
         if not isinstance(last, AIMessage) or not last.tool_calls:
             return {"messages": []}
 
-        writes_approved: bool = state.get("writes_approved", False)
+        # In "call" scope, a prior approval never counts — every batch of
+        # high-risk calls is re-prompted. In "session" scope (default), a
+        # prior approval this thread skips future prompts (see AgentState's
+        # `writes_approved` invariant).
+        writes_approved: bool = state.get("writes_approved", False) and approval_scope == "session"
 
         risky = [tc for tc in last.tool_calls if tc["name"] in HIGH_RISK_TOOLS
                  and not writes_approved]
@@ -134,19 +148,19 @@ def build_graph(llm: Any, repo_name: str) -> Any:
 
         # Run safe / already-approved tools immediately
         if safe:
-            safe_node = ToolNode(FILESYSTEM_TOOLS)
+            safe_node = ToolNode(ALL_TOOLS)
             safe_ai = AIMessage(content="", tool_calls=safe)
             result = safe_node.invoke({"messages": state["messages"][:-1] + [safe_ai]})
             tool_messages.extend(result["messages"])
 
-        # Handle risky tools — ask once, then remember the decision
+        # Handle risky tools — ask (subject to approval_scope), then record the decision
         if risky:
             approved = request_approval(risky)
             log_decision(repo_name=repo_name, tool_calls=risky, approved=approved)
 
             if approved:
-                state_updates["writes_approved"] = True  # skip future prompts
-                risky_node = ToolNode(FILESYSTEM_TOOLS)
+                state_updates["writes_approved"] = True  # meaningful only in "session" scope
+                risky_node = ToolNode(ALL_TOOLS)
                 risky_ai = AIMessage(content="", tool_calls=risky)
                 result = risky_node.invoke({"messages": state["messages"][:-1] + [risky_ai]})
                 tool_messages.extend(result["messages"])

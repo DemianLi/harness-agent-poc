@@ -1,4 +1,36 @@
-"""Memory middleware: loads AGENTS.md and per-repo memory into the system prompt."""
+"""Memory middleware: loads AGENTS.md and per-repo memory into the system prompt.
+
+Schema contract
+---------------
+`memory/AGENTS.md` (global) MUST contain, in order:
+    # Agent Memory
+    ## User Preferences
+    ## Notes
+`memory/repos/{repo_name}.md` (per-repo) MUST contain, in order:
+    # {repo_name}
+    ## Previous Analyses
+Both headers are load-bearing: the agent's memory-update instructions
+(`_MEMORY_GUIDELINES`) target `"## Previous Analyses\n"` as the anchor for
+`edit_file` appends. Renaming or removing these headers breaks the append
+contract silently (the `edit_file` call will fail with `not_unique`/"not
+found" rather than corrupting the file, per the tools error contract).
+
+Preference extraction contract
+-------------------------------
+`_extract_name_preference` recognises the keys in `_NAME_PREFERENCE_PATTERNS`
+(case-insensitive). Lines are scanned in file order and the FIRST matching
+line wins — later occurrences of the same key are ignored, not merged. This
+is a deliberate simplification: memory files are small and human-curated,
+so "first wins" avoids needing conflict-resolution logic and keeps update
+order easy to reason about (edits should replace the old line, not append
+a second one).
+
+Failure mode
+------------
+A missing memory file is not an error — `_read_file` returns `""` and the
+agent proceeds with no memory context. A malformed file (headers renamed or
+removed) degrades to "no preference detected", never a crash.
+"""
 
 from __future__ import annotations
 
@@ -94,17 +126,25 @@ class MemoryMiddleware(AgentMiddleware):
         return append_to_system(system, "\n\n".join(parts))
 
 
+# Recognised keys for a stored name preference (see "Preference extraction
+# contract" above). Add new synonyms here — this is the single source of
+# truth for what counts as a name-preference line.
+_NAME_PREFERENCE_PATTERNS = [
+    r"preferred_name[：:]\s*(.+)",
+    r"名字偏好[：:]\s*(.+)",
+    r"name preference[：:]\s*(.+)",
+]
+
+
 def _extract_name_preference(memory: str) -> str | None:
-    """Scan memory content for a stored name preference and return it, or None."""
+    """Scan memory content for a stored name preference and return it, or None.
+
+    Returns the first matching line's captured value, in file order.
+    """
     import re
-    patterns = [
-        r"preferred_name[：:]\s*(.+)",
-        r"名字偏好[：:]\s*(.+)",
-        r"name preference[：:]\s*(.+)",
-    ]
     for line in memory.splitlines():
         line = line.strip().lstrip("-• ")
-        for pattern in patterns:
+        for pattern in _NAME_PREFERENCE_PATTERNS:
             m = re.search(pattern, line, re.IGNORECASE)
             if m:
                 return m.group(1).strip()

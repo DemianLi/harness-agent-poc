@@ -11,11 +11,17 @@ Harness Engineering means wrapping an LLM core with a set of capabilities so it 
 
 | Layer | What it does |
 |-------|-------------|
-| **Memory** | Persists user preferences and per-repo findings across sessions via Markdown files |
+| **Model (Multi-LLM)** | Pluggable providers: Azure OpenAI, Claude, OpenAI, Gemini — with retry on transient errors |
 | **Tools** | `ls`, `read_file`, `glob`, `grep`, `write_file`, `edit_file` — full filesystem access |
+| **Memory** | Persists user preferences and per-repo findings across sessions via Markdown files |
 | **Context (Compact)** | Auto-summarises old conversation turns when the context window gets full |
-| **Permission (HITL)** | Pauses before writing files — one approval covers the whole session |
-| **Multi-LLM** | Pluggable providers: Azure OpenAI, Claude, OpenAI, Gemini |
+| **Permission (HITL)** | Pauses before writing files; approval scope is configurable — one approval per session (default), or re-confirm every call with `--approval-scope call` |
+| **Orchestration** | LangGraph state machine driving the agent↔tools control loop |
+| **Interaction** *(extension)* | `ask_user` tool — the agent can pause and ask a clarifying question instead of guessing |
+| **Feedback** *(extension)* | Skippable 👍/👎 prompt after any turn that actually did something, logged to `memory/feedback.log` |
+
+See [`docs/SPEC.md`](docs/SPEC.md) for the normative contract (interfaces,
+error taxonomy, config parameters, invariants, and failure modes) of each layer.
 
 ---
 

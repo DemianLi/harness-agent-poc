@@ -13,6 +13,8 @@ from rich.table import Table
 
 from .agent import build_graph
 from .llm.providers import create_llm, ensure_config_exists
+from .middleware.feedback import maybe_prompt_feedback
+from .middleware.hitl import VALID_APPROVAL_SCOPES
 from .middleware.memory import GLOBAL_MEMORY_FILE, MEMORY_DIR, REPO_MEMORY_DIR, ensure_memory_files
 
 console = Console()
@@ -55,14 +57,17 @@ def cli() -> None:
 @click.argument("repo_name")
 @click.option("--model", type=click.Choice(PROVIDERS), default=None,
               help="LLM provider (overrides config default).")
-def chat(repo_name: str, model: str | None) -> None:
+@click.option("--approval-scope", type=click.Choice(VALID_APPROVAL_SCOPES), default=None,
+              help="'session' (default): approve write_file once per session. "
+                   "'call': re-prompt every time. Overrides HARNESS_APPROVAL_SCOPE.")
+def chat(repo_name: str, model: str | None, approval_scope: str | None) -> None:
     """Start an interactive chat session about a repository.
 
     REPO_NAME is the directory name of the repository to load.
     If previous analysis reports exist, they are loaded as context automatically.
     Type 'exit' or press Ctrl+C to quit.
     """
-    repo, llm, app, config = _setup_session(repo_name, model)
+    repo, llm, app, config = _setup_session(repo_name, model, approval_scope)
     if repo is None:
         return
 
@@ -107,13 +112,16 @@ def chat(repo_name: str, model: str | None) -> None:
 @click.argument("repo_name")
 @click.option("--model", type=click.Choice(PROVIDERS), default=None,
               help="LLM provider (overrides config default).")
-def analyze(repo_name: str, model: str | None) -> None:
+@click.option("--approval-scope", type=click.Choice(VALID_APPROVAL_SCOPES), default=None,
+              help="'session' (default): approve write_file once per session. "
+                   "'call': re-prompt every time. Overrides HARNESS_APPROVAL_SCOPE.")
+def analyze(repo_name: str, model: str | None, approval_scope: str | None) -> None:
     """Run a structured analysis of a repository, then stay in chat.
 
     REPO_NAME is the directory name of the repository to analyse.
     After the analysis is written, you can continue asking questions.
     """
-    repo, llm, app, config = _setup_session(repo_name, model)
+    repo, llm, app, config = _setup_session(repo_name, model, approval_scope)
     if repo is None:
         return
 
@@ -199,7 +207,7 @@ def _chat_with_reports(repo: Path, existing: dict[str, str], app: any, config: d
 # Shared setup                                                                 #
 # --------------------------------------------------------------------------- #
 
-def _setup_session(repo_name: str, model: str | None):
+def _setup_session(repo_name: str, model: str | None, approval_scope: str | None = None):
     """Find repo, confirm with user, build agent. Returns (repo, llm, app, config) or Nones."""
     matches = _find_repos(repo_name)
     if not matches:
@@ -217,7 +225,7 @@ def _setup_session(repo_name: str, model: str | None):
     ensure_memory_files(repo.name)
 
     llm = create_llm(provider=model)
-    app = build_graph(llm=llm, repo_name=repo.name)
+    app = build_graph(llm=llm, repo_name=repo.name, approval_scope=approval_scope)
     config = {"configurable": {"thread_id": f"chat-{repo.name}"}}
     return repo, llm, app, config
 
@@ -243,7 +251,12 @@ def _repl(app: any, initial_state: dict, config: dict, repo_name: str) -> None:
     try:
         while True:
             # Stream agent response
-            _stream_response(app, current_input, config)
+            tool_names = _stream_response(app, current_input, config)
+
+            # Ask for a quick, skippable rating after a turn that actually
+            # did something (see middleware/feedback.py's contract) — a
+            # pure conversational reply does not trigger this.
+            maybe_prompt_feedback(repo_name, tool_names)
 
             # Prompt for next input
             console.print()
@@ -266,8 +279,14 @@ def _repl(app: any, initial_state: dict, config: dict, repo_name: str) -> None:
     _print_report_locations(repo_name)
 
 
-def _stream_response(app: any, input_state: dict, config: dict) -> None:
-    """Stream one agent turn to the console."""
+def _stream_response(app: any, input_state: dict, config: dict) -> list[str]:
+    """Stream one agent turn to the console.
+
+    Returns the names of tools actually invoked this turn (excluding
+    `ask_user`, which is a clarification, not a completed action) — used by
+    `_repl` to decide whether to show the post-turn feedback prompt.
+    """
+    tool_names: list[str] = []
     for event in app.stream(input_state, config, stream_mode="values"):
         messages = event.get("messages", [])
         if not messages:
@@ -281,6 +300,9 @@ def _stream_response(app: any, input_state: dict, config: dict) -> None:
                 for tc in last.tool_calls:
                     preview = _format_args_preview(tc.get("args", {}))
                     console.print(f"[dim]→ {tc['name']}({preview})[/dim]")
+                    if tc["name"] != "ask_user":
+                        tool_names.append(tc["name"])
+    return tool_names
 
 
 # --------------------------------------------------------------------------- #
@@ -409,12 +431,14 @@ def _print_report_locations(repo_name: str) -> None:
 def config() -> None:
     """Show the current configuration and memory file paths."""
     from .llm.providers import CONFIG_PATH, get_default_provider, load_config
+    from .middleware.hitl import resolve_approval_scope
 
     ensure_config_exists()
     cfg = load_config()
 
     console.print(f"\n[bold]Config:[/bold]       {CONFIG_PATH}")
     console.print(f"[bold]Provider:[/bold]     {get_default_provider()}")
+    console.print(f"[bold]Approval scope:[/bold] {resolve_approval_scope()}")
     console.print(f"[bold]Memory dir:[/bold]   {MEMORY_DIR}")
 
     if cfg.get("llm", {}).get("model"):

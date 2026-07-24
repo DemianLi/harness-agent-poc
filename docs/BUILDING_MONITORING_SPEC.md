@@ -444,6 +444,56 @@ Edge 節點對 BMS／SCADA **只能讀取，不應有寫入權限**——呼應 
 
 ---
 
+## 18. 技術選型與工具鏈建議
+
+本節回應「六層/七層 harness 架構要落地在這個應用場景，對應到哪些具體技術／框架／測試工具」——這些是**建議**，不是既定決策，仍需依實際評估（授權條款、自架可行性、團隊熟悉度）確認後才落地。技術棧沿用已確認的 Python + LangChain/LangGraph（§0）。
+
+### 18.1 設備 MCP 整合（對應 D1／§3）
+
+- **`langchain-mcp-adapters`**（LangChain 官方套件）：提供 `MultiServerMCPClient`，可同時連接多個設備商各自的 MCP server，將 MCP tool schema 轉為 LangChain-compatible tools；預設無狀態、每次呼叫獨立 session，適合多棟大樓／多廠牌並存的場景。
+- **MCP Inspector**（MCP 官方工具）：在正式串接前，用它連上設備商 MCP server 實際檢視 `tools/list` 回傳的 schema——這是驗證 §17 #16（設備 MCP 是否回傳 `quality`／`timestamp`）的具體方法，也支援 `--cli` 模式接入 CI 做自動化檢查。
+
+### 18.2 記憶／狀態持久化（對應現行 `docs/SPEC.md` Memory 層）
+
+現行 CLI 工具用的 `MemorySaver` 僅為 in-memory，不具持久化能力，正式上線需替換為：
+- **`PostgresSaver`**（`langgraph-checkpoint-postgres`）或 `SqliteSaver`——checkpoint 持久化，支援跨行程/重啟後恢復
+- **LangGraph Store API**（`PostgresStore`）——跨 session 的長期記憶（例如記住使用者慣用查詢的大樓／樓層）
+
+### 18.3 生命週期與人工核准（對應 D6／現行 Permission 層）
+
+LangGraph 官方自 2024 年底起將 **`interrupt()` + `Command(resume=...)`** 訂為 HITL 的建議寫法，取代舊的 `interrupt_before`/`interrupt_after`。建議評估將現有 `middleware/hitl.py` 的自訂核准邏輯遷移至此原生機制，理由：
+- 暫停／恢復語意由框架原生支援，不需自行維護 `writes_approved` 狀態欄位
+- 搭配 checkpointer 可做「time travel」回溯到早期 state，對應 ETCLOVG Lifecycle 層點出的 rollback 需求（例如工單建立中途失敗時的回滾）
+
+### 18.4 可觀測性（對應 ETCLOVG Observability 層缺口）
+
+**Langfuse（自架版）**：MIT 授權、可用 Docker/Helm 完全自架，原生支援 LangChain/LangGraph tracing（trace、tool 呼叫、延遲、成本、多輪對話）。相較 LangSmith 等 SaaS 方案，自架版更符合 D10（OT/IT 安全邊界）的資料主權要求——監控資料不需送到第三方才能做可觀測性。這一層目前兩份 SPEC 都沒有獨立設計，屬於新增能力。
+
+### 18.5 驗證與測試（對應 D11／§13）
+
+三項工具分工互補，建議搭配使用：
+
+| 工具 | 用途 | 對應規則 |
+|---|---|---|
+| **Ragas** | `faithfulness`／grounding 分數，可設門檻（如 ≥0.85）作為 CI gate | D3 強制 grounding 規則 |
+| **`agentevals`**（LangChain 官方） | Trajectory 評估——驗證 agent 是否按規定順序呼叫工具（如「必須先呼叫 `get_realtime_point`」），而非只看最終答案 | D3「陳述必須對應工具呼叫」 |
+| **promptfoo** | YAML 驅動的回歸測試＋red-teaming（含 OWASP LLM Top 10、prompt injection），可接 CI | D11 生命安全對抗測試案例、D10 prompt injection 防護 |
+
+### 18.6 護欄執行層（對應 D3）
+
+- **Guardrails AI**：Pydantic 風格輸出驗證，可強制回答必須附帶 `point_id`／`timestamp` 等結構化欄位，而非僅靠 system prompt 文字約束
+- **NeMo Guardrails**：以 Colang 撰寫對話層策略，可將「生命安全查詢一律保守回答」寫成可執行的 dialog rail
+
+### 18.7 RBAC／權限治理（對應 D5、D6）
+
+**限制與建議**：LangGraph Platform 內建的 custom Auth（可做 RBAC）僅在 Managed Cloud 或付費 enterprise 自架授權下可用，與 D9 傾向的 Edge/Cloud 自架、不綁定單一供應商的方向有落差。建議繼續採自訂路線（包一層 FastAPI + OAuth2/OIDC，延伸現有 `middleware/` 模式），不依賴該項付費功能。
+
+### `[待確認]`
+
+以上為建議選項，非最終決策；實際採用前需確認：授權條款是否符合公司採購規範、自架維運人力是否足夠、與現有基礎設施（§11 D9）的整合成本。
+
+---
+
 ## 附錄：與現行 `docs/SPEC.md` 的關係
 
 本文件不是現行 SPEC 的修訂版，而是**新產品的獨立規格**。兩者共用同一套撰寫方法論（介面契約＋錯誤分類＋設定依據＋不變量＋失敗模式＋信任邊界），也共用同一套技術棧（Python + LangChain/LangGraph），但服務對象完全不同——現行 SPEC 服務「本地單人 CLI repo 問答代理」，本文件服務「多棟大樓、多角色、含生命安全查詢的正式上線產品」。可重用的是**模式**（Model 層 provider abstraction、Tools 層 Pydantic schema 契約、Permission 層批次核准機制），不可重用的是**內容**（檔案系統工具、Markdown 記憶、單人單 process 假設）——詳見先前的〈SPEC 產品級成熟度評估報告〉逐層對照表。

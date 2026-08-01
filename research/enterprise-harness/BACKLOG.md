@@ -27,7 +27,8 @@
 
 ## 第一階段：核心架構
 
-- [ ] 01 — Harness 解剖學：模型與使用者之間到底有哪幾層（system prompt、tools、context、memory、permission、orchestration）
+- [x] 01 — Harness 解剖學：模型與使用者之間到底有哪幾層（system prompt、tools、context、memory、permission、orchestration）
+      → [`reports/01-harness-anatomy.md`](reports/01-harness-anatomy.md)（提出 L0–L9 十層骨架，後續主題沿用）
 - [ ] 02 — System prompt 架構：組裝、分層、版本控管、A/B 與 regression
 - [ ] 03 — 工具層設計：tool schema 設計原則、工具數量爆炸的解法（tool search / deferred tools）、錯誤回傳語意
 - [ ] 04 — Context window 管理：compaction、摘要策略、何時該檢索而非塞入、prompt caching 的成本模型

@@ -209,3 +209,8 @@ __marimo__/
 # Runtime memory files — tracked locally only
 memory/AGENTS.md
 memory/repos/*.md
+
+# deep-research plugin scratch — transient per-run working files.
+# The pipeline archives what's worth keeping into docs/research/archive/
+# at the end of a run, then deletes the scratch directory.
+tasks/scratch/
